@@ -6,7 +6,7 @@ description: Demonstrates how to use the flutter_pos_printer_platform plugin.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 
 environment:
-  sdk: '>=2.18.4 <3.3.10'
+  sdk: '>=2.18.4 <4.0.0'
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -31,6 +31,7 @@ dependencies:
   cupertino_icons: ^1.0.2
 
   esc_pos_utils: ^1.1.0
+  network_info_plus: ^6.1.4
 
 dev_dependencies:
   flutter_test:
