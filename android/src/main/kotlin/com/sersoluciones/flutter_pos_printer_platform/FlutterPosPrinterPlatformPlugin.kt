@@ -289,7 +289,19 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                 printRawData(raw, result)
             }
             call.method.equals("printBytes") -> {
-                val bytes: ArrayList<Int>? = call.argument("bytes")
+                // FIXED: Handle both byte[] and ArrayList<Int> from Flutter
+                val bytesArg: Any? = call.argument("bytes")
+                val bytes: ArrayList<Int>? = when (bytesArg) {
+                    is ByteArray -> {
+                        // Convert ByteArray to ArrayList<Int>
+                        ArrayList(bytesArg.map { it.toInt() and 0xFF })
+                    }
+                    is ArrayList<*> -> {
+                        @Suppress("UNCHECKED_CAST")
+                        bytesArg as? ArrayList<Int>
+                    }
+                    else -> null
+                }
                 printBytes(bytes, result)
             }
             else -> {

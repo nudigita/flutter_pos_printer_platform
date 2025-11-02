@@ -205,44 +205,57 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
     }
 
     fun printBytes(bytes: ArrayList<Int>): Boolean {
-        Log.v(LOG_TAG, "Printing bytes")
+        Log.v(LOG_TAG, "Printing ${bytes.size} bytes to USB")
         val isConnected = openConnection()
         if (isConnected) {
             val chunkSize = mEndPoint!!.maxPacketSize
-            Log.v(LOG_TAG, "Max Packet Size: $chunkSize")
-            Log.v(LOG_TAG, "Connected to device")
-            Thread {
-                synchronized(printLock) {
-                    val vectorData: Vector<Byte> = Vector()
-                    for (i in bytes.indices) {
-                        val `val`: Int = bytes[i]
-                        vectorData.add(`val`.toByte())
-                    }
-                    val temp: Array<Any> = vectorData.toTypedArray()
-                    val byteData = ByteArray(temp.size)
-                    for (i in temp.indices) {
-                        byteData[i] = temp[i] as Byte
-                    }
-                    var b = 0
-                    if (mUsbDeviceConnection != null) {
-                        if (byteData.size > chunkSize) {
-                            var chunks: Int = byteData.size / chunkSize
-                            if (byteData.size % chunkSize > 0) {
-                                ++chunks
-                            }
-                            for (i in 0 until chunks) {
-//                                val buffer: ByteArray = byteData.copyOfRange(i * chunkSize, chunkSize + i * chunkSize)
-                                val buffer: ByteArray = Arrays.copyOfRange(byteData, i * chunkSize, chunkSize + i * chunkSize)
-                                b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, buffer, chunkSize, 100000)
-                            }
-                        } else {
-                            b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, byteData, byteData.size, 100000)
-                        }
-                        Log.i(LOG_TAG, "Return code: $b")
-                    }
+            Log.v(LOG_TAG, "USB endpoint max packet size: $chunkSize")
+
+            // FIXED: Run synchronously instead of in background thread
+            synchronized(printLock) {
+                val vectorData: Vector<Byte> = Vector()
+                for (i in bytes.indices) {
+                    val `val`: Int = bytes[i]
+                    vectorData.add(`val`.toByte())
                 }
-            }.start()
-            return true
+                val temp: Array<Any> = vectorData.toTypedArray()
+                val byteData = ByteArray(temp.size)
+                for (i in temp.indices) {
+                    byteData[i] = temp[i] as Byte
+                }
+
+                if (mUsbDeviceConnection != null) {
+                    var success = true
+                    if (byteData.size > chunkSize) {
+                        var chunks: Int = byteData.size / chunkSize
+                        if (byteData.size % chunkSize > 0) {
+                            ++chunks
+                        }
+                        Log.v(LOG_TAG, "Sending data in $chunks chunks")
+                        for (i in 0 until chunks) {
+                            val buffer: ByteArray = Arrays.copyOfRange(byteData, i * chunkSize, minOf(chunkSize + i * chunkSize, byteData.size))
+                            val b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, buffer, buffer.size, 100000)
+                            Log.i(LOG_TAG, "Chunk $i return code: $b")
+                            if (b < 0) {
+                                Log.e(LOG_TAG, "USB transfer failed for chunk $i with error code: $b")
+                                success = false
+                                break
+                            }
+                        }
+                    } else {
+                        val b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, byteData, byteData.size, 100000)
+                        Log.i(LOG_TAG, "USB bulkTransfer return code: $b (expected ${byteData.size})")
+                        if (b < 0) {
+                            Log.e(LOG_TAG, "USB transfer failed with error code: $b")
+                            success = false
+                        }
+                    }
+                    return success
+                } else {
+                    Log.e(LOG_TAG, "USB connection is null!")
+                    return false
+                }
+            }
         } else {
             Log.v(LOG_TAG, "Failed to connected to device")
             return false
