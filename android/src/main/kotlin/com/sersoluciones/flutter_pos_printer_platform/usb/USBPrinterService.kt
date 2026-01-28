@@ -82,7 +82,12 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         }
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        mContext!!.registerReceiver(mUsbDeviceReceiver, filter)
+        // Android 14+ requires specifying receiver export behavior
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            mContext!!.registerReceiver(mUsbDeviceReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            mContext!!.registerReceiver(mUsbDeviceReceiver, filter)
+        }
         Log.v(LOG_TAG, "ESC/POS Printer initialized")
     }
 
