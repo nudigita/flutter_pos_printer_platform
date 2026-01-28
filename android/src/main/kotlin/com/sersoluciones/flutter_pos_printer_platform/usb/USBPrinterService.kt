@@ -70,8 +70,8 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
     fun init(reactContext: Context?) {
         mContext = reactContext
         mUSBManager = mContext!!.getSystemService(Context.USB_SERVICE) as UsbManager
-        mPermissionIndent = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+ requires explicit intent with FLAG_MUTABLE
+        mPermissionIndent = if (android.os.Build.VERSION.SDK_INT >= 34) {
+            // Android 14 (API 34)+ requires explicit intent with FLAG_MUTABLE
             PendingIntent.getBroadcast(mContext, 0, Intent(ACTION_USB_PERMISSION).apply {
                 setPackage(mContext!!.packageName)
             }, PendingIntent.FLAG_MUTABLE)
