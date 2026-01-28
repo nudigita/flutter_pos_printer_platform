@@ -83,8 +83,9 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         val filter = IntentFilter(ACTION_USB_PERMISSION)
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         // Android 14+ requires specifying receiver export behavior
+        // RECEIVER_NOT_EXPORTED = 4 (Context.RECEIVER_NOT_EXPORTED)
         if (android.os.Build.VERSION.SDK_INT >= 34) {
-            mContext!!.registerReceiver(mUsbDeviceReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            mContext!!.registerReceiver(mUsbDeviceReceiver, filter, 4)
         } else {
             mContext!!.registerReceiver(mUsbDeviceReceiver, filter)
         }
