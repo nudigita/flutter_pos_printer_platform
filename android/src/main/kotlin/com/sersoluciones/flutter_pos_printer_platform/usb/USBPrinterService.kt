@@ -25,6 +25,19 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
     private var mEndPoint: UsbEndpoint? = null
     var state: Int = STATE_USB_NONE
 
+    // A print job that arrived before USB permission was granted. Runtime USB
+    // permissions are wiped on every reboot, so the first job after boot races
+    // ahead of the async grant. We stash it here and run it from the
+    // ACTION_USB_PERMISSION receiver once the grant actually lands.
+    private var mPendingPrintBytes: ArrayList<Int>? = null
+
+    // The vendor/product the app last asked us to print to (via selectDevice).
+    // We only adopt a permission grant as the active print target when it matches
+    // this — so the startup pre-warm, which requests permission for *every*
+    // attached USB device, never hijacks mUsbDevice with a non-printer device.
+    private var mSelectedVendorId: Int? = null
+    private var mSelectedProductId: Int? = null
+
     fun setHandler(handler: Handler?) {
         mHandler = handler
     }
@@ -35,18 +48,54 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
             if ((ACTION_USB_PERMISSION == action)) {
                 synchronized(this) {
                     val usbDevice: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    // Only react to the device the app actually selected. The startup
+                    // pre-warm requests permission for every attached USB device, so a
+                    // grant here may be for an unrelated device (touch controller, hub,
+                    // card reader). Those must not become the active print target.
+                    val isSelectedTarget = usbDevice != null &&
+                        usbDevice.vendorId == mSelectedVendorId &&
+                        usbDevice.productId == mSelectedProductId
                     if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                         Log.i(
                             LOG_TAG,
                             "Success get permission for device ${usbDevice?.deviceId}, vendor_id: ${usbDevice?.vendorId} product_id: ${usbDevice?.productId}"
                         )
-                        mUsbDevice = usbDevice
-                        state = STATE_USB_CONNECTED
-                        mHandler?.obtainMessage(STATE_USB_CONNECTED)?.sendToTarget()
-                    } else {
+                        if (isSelectedTarget) {
+                            mUsbDevice = usbDevice
+                            state = STATE_USB_CONNECTED
+                            mHandler?.obtainMessage(STATE_USB_CONNECTED)?.sendToTarget()
+
+                            // The grant has landed. If a print job was deferred while
+                            // waiting for it, run it now — this is the missing link that
+                            // made the first print after every reboot fail. onReceive runs
+                            // on the main thread, the same thread printBytes() runs on, so
+                            // invoking it here preserves the existing synchronous behaviour.
+                            val pending = mPendingPrintBytes
+                            if (pending != null) {
+                                mPendingPrintBytes = null
+                                Log.i(LOG_TAG, "Running deferred USB print job after permission grant")
+                                val printed = doPrintBytes(pending)
+                                Log.i(LOG_TAG, "Deferred USB print job completed: $printed")
+                            } else {
+                                Log.v(LOG_TAG, "Permission granted; no deferred USB print job pending")
+                            }
+                        } else {
+                            // Pre-warm grant for a non-target device: permission is now
+                            // cached at OS level, but it isn't our printer — leave the
+                            // active device untouched.
+                            Log.v(LOG_TAG, "USB permission cached for non-target device; ignoring")
+                        }
+                    } else if (isSelectedTarget) {
+                        // Our printer's permission was denied: surface a clear error and
+                        // drop the deferred job rather than letting it hang or silently
+                        // disappear. (Denials for non-target pre-warm devices are ignored.)
+                        mPendingPrintBytes = null
+                        Log.e(LOG_TAG, "USB permission denied for device ${usbDevice?.deviceName}; dropping pending print job")
                         Toast.makeText(context, mContext?.getString(R.string.user_refuse_perm) + ": ${usbDevice!!.deviceName}", Toast.LENGTH_LONG).show()
                         state = STATE_USB_NONE
                         mHandler?.obtainMessage(STATE_USB_NONE)?.sendToTarget()
+                    } else {
+                        Log.v(LOG_TAG, "USB permission denied for non-target device ${usbDevice?.deviceName}; ignoring")
                     }
                 }
             } else if ((UsbManager.ACTION_USB_DEVICE_DETACHED == action)) {
@@ -90,6 +139,21 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
             mContext!!.registerReceiver(mUsbDeviceReceiver, filter)
         }
         Log.v(LOG_TAG, "ESC/POS Printer initialized")
+
+        // Belt-and-braces: pre-request permission for already-attached USB devices
+        // at startup. Runtime USB permissions are cleared on every reboot, so doing
+        // this here lets the grant land and cache well before the first receipt is
+        // printed — making even a one-shot print path immune to the boot-time race.
+        try {
+            for (device in ArrayList(mUSBManager!!.deviceList.values)) {
+                if (!mUSBManager!!.hasPermission(device)) {
+                    Log.v(LOG_TAG, "Pre-warming USB permission for device ${device.deviceName} (vendor_id: ${device.vendorId}, product_id: ${device.productId})")
+                    mUSBManager!!.requestPermission(device, mPermissionIndent)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "USB permission pre-warm failed: ${e.message}")
+        }
     }
 
     fun closeConnectionIfExists() {
@@ -114,6 +178,8 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
 
     fun selectDevice(vendorId: Int, productId: Int): Boolean {
 //        Log.v(LOG_TAG, " status usb ______ $state")
+        mSelectedVendorId = vendorId
+        mSelectedProductId = productId
         if ((mUsbDevice == null) || (mUsbDevice!!.vendorId != vendorId) || (mUsbDevice!!.productId != productId)) {
             synchronized(printLock) {
                 closeConnectionIfExists()
@@ -217,6 +283,41 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
 
     fun printBytes(bytes: ArrayList<Int>): Boolean {
         Log.v(LOG_TAG, "Printing ${bytes.size} bytes to USB")
+
+        // Gate on permission. On a freshly booted device the runtime USB grant is
+        // gone, so selectDevice() has only *requested* it and mUsbDevice is still
+        // null / unpermitted. Opening + sending now would hit the async grant race
+        // and fail ("USB Device is not initialized"). Instead, stash the job and let
+        // the ACTION_USB_PERMISSION receiver run it once the grant lands.
+        //
+        // Require that mUsbDevice is the device selectDevice() just chose AND that we
+        // hold permission for it — so a stale device (e.g. after switching between two
+        // USB printers) is never printed to, and a missing grant always defers.
+        val device = mUsbDevice
+        val targetReady = device != null &&
+            device.vendorId == mSelectedVendorId &&
+            device.productId == mSelectedProductId &&
+            mUSBManager?.hasPermission(device) == true
+        if (!targetReady) {
+            Log.i(LOG_TAG, "USB target not ready (permission pending); deferring print job until grant lands")
+            mPendingPrintBytes = bytes
+            // Re-request only when the active device IS the selected one but its grant
+            // is missing (e.g. revoked). For a null/mismatched device, selectDevice()
+            // has already requested the correct device — don't poke a stale one.
+            if (device != null &&
+                device.vendorId == mSelectedVendorId &&
+                device.productId == mSelectedProductId) {
+                mUSBManager?.requestPermission(device, mPermissionIndent)
+            }
+            // selectDevice() (called by connectPrinter, before this) has already
+            // fired requestPermission for the selected device, so the grant is on its
+            // way regardless. Report accepted; the receiver runs the job on grant.
+            return true
+        }
+        return doPrintBytes(bytes)
+    }
+
+    private fun doPrintBytes(bytes: ArrayList<Int>): Boolean {
         val isConnected = openConnection()
         if (isConnected) {
             val chunkSize = mEndPoint!!.maxPacketSize
