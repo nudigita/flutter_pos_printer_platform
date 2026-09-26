@@ -8,35 +8,79 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.*
 import android.os.Handler
-import android.util.Base64
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
 import com.sersoluciones.flutter_pos_printer_platform.R
-import java.nio.charset.Charset
 import java.util.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
+/**
+ * USB printing on Android.
+ *
+ * Threading:
+ *  - Main thread: method-channel calls ([selectDevice], [printBytes]) and the
+ *    permission / detach broadcasts. It owns [mPendingJobs] and the selection.
+ *  - [mPrintExecutor] (one thread): owns the open connection ([mUsbDevice],
+ *    [mUsbDeviceConnection], [mUsbInterface], [mEndPoint]) and runs every
+ *    transfer, one job at a time, in the order the jobs were accepted.
+ *
+ * Every job carries the printer that was selected when it was sent, so a job
+ * can never land on another printer, and every job reports whether its bytes
+ * actually reached the printer — the caller is answered only after the
+ * transfer, not when the job is accepted.
+ *
+ * A job for a printer we don't hold permission for (runtime USB grants are
+ * wiped on reboot and on re-plug) waits in [mPendingJobs] until the grant
+ * lands. Jobs queue there in order; none is ever dropped in favour of a
+ * later one.
+ *
+ * A job must start within [JOB_START_DEADLINE_MS] of being accepted — whether
+ * it waited for a grant or behind a stalled transfer — or it fails unsent:
+ * by then the app has stopped waiting and will retry, and the late copy would
+ * print twice.
+ */
 class USBPrinterService private constructor(private var mHandler: Handler?) {
     private var mContext: Context? = null
     private var mUSBManager: UsbManager? = null
     private var mPermissionIndent: PendingIntent? = null
+
+    // Owned by mPrintExecutor. mUsbDevice is read from the main thread only to
+    // recognise our printer in a detach broadcast.
+    @Volatile
     private var mUsbDevice: UsbDevice? = null
     private var mUsbDeviceConnection: UsbDeviceConnection? = null
     private var mUsbInterface: UsbInterface? = null
     private var mEndPoint: UsbEndpoint? = null
+
+    @Volatile
     var state: Int = STATE_USB_NONE
 
-    // A print job that arrived before USB permission was granted. Runtime USB
-    // permissions are wiped on every reboot, so the first job after boot races
-    // ahead of the async grant. We stash it here and run it from the
-    // ACTION_USB_PERMISSION receiver once the grant actually lands.
-    private var mPendingPrintBytes: ArrayList<Int>? = null
-
-    // The vendor/product the app last asked us to print to (via selectDevice).
-    // We only adopt a permission grant as the active print target when it matches
-    // this — so the startup pre-warm, which requests permission for *every*
-    // attached USB device, never hijacks mUsbDevice with a non-printer device.
+    // The printer the app last selected via connectPrinter; printBytes sends to
+    // it. Main thread only.
     private var mSelectedVendorId: Int? = null
     private var mSelectedProductId: Int? = null
+
+    // Jobs waiting for a USB permission grant, oldest first. Main thread only.
+    private val mPendingJobs = ArrayDeque<PrintJob>()
+
+    private val mMainHandler = Handler(Looper.getMainLooper())
+    private val mPrintExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    private class PrintJob(
+        val vendorId: Int,
+        val productId: Int,
+        val bytes: ByteArray,
+        /** Invoked exactly once, on the main thread. */
+        val onDone: (Boolean) -> Unit,
+    ) {
+        val acceptedAt: Long = SystemClock.elapsedRealtime()
+
+        fun isFor(device: UsbDevice) =
+            device.vendorId == vendorId && device.productId == productId
+    }
 
     fun setHandler(handler: Handler?) {
         mHandler = handler
@@ -44,76 +88,47 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
 
     private val mUsbDeviceReceiver: BroadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            val action = intent.action
-            if ((ACTION_USB_PERMISSION == action)) {
-                synchronized(this) {
-                    val usbDevice: UsbDevice? = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-                    // Only react to the device the app actually selected. The startup
-                    // pre-warm requests permission for every attached USB device, so a
-                    // grant here may be for an unrelated device (touch controller, hub,
-                    // card reader). Those must not become the active print target.
-                    val isSelectedTarget = usbDevice != null &&
-                        usbDevice.vendorId == mSelectedVendorId &&
-                        usbDevice.productId == mSelectedProductId
-                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
-                        Log.i(
-                            LOG_TAG,
-                            "Success get permission for device ${usbDevice?.deviceId}, vendor_id: ${usbDevice?.vendorId} product_id: ${usbDevice?.productId}"
-                        )
-                        if (isSelectedTarget) {
-                            mUsbDevice = usbDevice
-                            state = STATE_USB_CONNECTED
-                            mHandler?.obtainMessage(STATE_USB_CONNECTED)?.sendToTarget()
-
-                            // The grant has landed. If a print job was deferred while
-                            // waiting for it, run it now — this is the missing link that
-                            // made the first print after every reboot fail. onReceive runs
-                            // on the main thread, the same thread printBytes() runs on, so
-                            // invoking it here preserves the existing synchronous behaviour.
-                            val pending = mPendingPrintBytes
-                            if (pending != null) {
-                                mPendingPrintBytes = null
-                                Log.i(LOG_TAG, "Running deferred USB print job after permission grant")
-                                val printed = doPrintBytes(pending)
-                                Log.i(LOG_TAG, "Deferred USB print job completed: $printed")
-                            } else {
-                                Log.v(LOG_TAG, "Permission granted; no deferred USB print job pending")
-                            }
-                        } else {
-                            // Pre-warm grant for a non-target device: permission is now
-                            // cached at OS level, but it isn't our printer — leave the
-                            // active device untouched.
-                            Log.v(LOG_TAG, "USB permission cached for non-target device; ignoring")
-                        }
-                    } else if (isSelectedTarget) {
-                        // Our printer's permission was denied: surface a clear error and
-                        // drop the deferred job rather than letting it hang or silently
-                        // disappear. (Denials for non-target pre-warm devices are ignored.)
-                        mPendingPrintBytes = null
-                        Log.e(LOG_TAG, "USB permission denied for device ${usbDevice?.deviceName}; dropping pending print job")
-                        Toast.makeText(context, mContext?.getString(R.string.user_refuse_perm) + ": ${usbDevice!!.deviceName}", Toast.LENGTH_LONG).show()
-                        state = STATE_USB_NONE
-                        mHandler?.obtainMessage(STATE_USB_NONE)?.sendToTarget()
-                    } else {
-                        Log.v(LOG_TAG, "USB permission denied for non-target device ${usbDevice?.deviceName}; ignoring")
-                    }
-                }
-            } else if ((UsbManager.ACTION_USB_DEVICE_DETACHED == action)) {
-
-                if (mUsbDevice != null) {
-                    Toast.makeText(context, mContext?.getString(R.string.device_off), Toast.LENGTH_LONG).show()
-                    closeConnectionIfExists()
-                    state = STATE_USB_NONE
-                    mHandler?.obtainMessage(STATE_USB_NONE)?.sendToTarget()
-                }
-
-            } else if ((UsbManager.ACTION_USB_DEVICE_ATTACHED == action)) {
-//                if (mUsbDevice != null) {
-//                    Toast.makeText(context, "USB device has been turned off", Toast.LENGTH_LONG).show()
-//                    closeConnectionIfExists()
-//                }
+            val usbDevice: UsbDevice = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE) ?: return
+            when (intent.action) {
+                ACTION_USB_PERMISSION -> onPermissionResult(
+                    context,
+                    usbDevice,
+                    intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false),
+                )
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> onDetached(context, usbDevice)
             }
         }
+    }
+
+    private fun onPermissionResult(context: Context, device: UsbDevice, granted: Boolean) {
+        // The startup pre-warm requests permission for every attached device, so
+        // a result here may be for a touch controller or a card reader. Only jobs
+        // waiting on this device care.
+        val waiting = takePendingJobsFor(device)
+        if (granted) {
+            Log.i(LOG_TAG, "USB permission granted for ${device.deviceName} (vendor_id: ${device.vendorId}, product_id: ${device.productId}); ${waiting.size} job(s) waiting")
+            // Also when nothing is waiting: a grant that lands after its job
+            // gave up tells the app the printer is usable again, so it retries.
+            if (waiting.isNotEmpty() || isSelected(device)) updateState(STATE_USB_CONNECTED)
+            waiting.forEach { submit(it) }
+        } else if (waiting.isNotEmpty()) {
+            Log.e(LOG_TAG, "USB permission denied for ${device.deviceName}; failing ${waiting.size} print job(s)")
+            Toast.makeText(context, mContext?.getString(R.string.user_refuse_perm) + ": ${device.deviceName}", Toast.LENGTH_LONG).show()
+            updateState(STATE_USB_NONE)
+            waiting.forEach { it.onDone(false) }
+        } else {
+            Log.v(LOG_TAG, "USB permission denied for non-printer device ${device.deviceName}; ignoring")
+        }
+    }
+
+    private fun onDetached(context: Context, device: UsbDevice) {
+        takePendingJobsFor(device).forEach { it.onDone(false) }
+        // Other USB devices (scanner, caller-ID modem, touch controller) come and
+        // go; only our printer's detach should drop the connection.
+        if (mUsbDevice?.deviceName != device.deviceName) return
+        Toast.makeText(context, mContext?.getString(R.string.device_off), Toast.LENGTH_LONG).show()
+        mPrintExecutor.execute { closeConnection() }
+        updateState(STATE_USB_NONE)
     }
 
     fun init(reactContext: Context?) {
@@ -143,7 +158,7 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         // Belt-and-braces: pre-request permission for already-attached USB devices
         // at startup. Runtime USB permissions are cleared on every reboot, so doing
         // this here lets the grant land and cache well before the first receipt is
-        // printed — making even a one-shot print path immune to the boot-time race.
+        // printed.
         try {
             for (device in ArrayList(mUSBManager!!.deviceList.values)) {
                 if (!mUSBManager!!.hasPermission(device)) {
@@ -156,15 +171,9 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         }
     }
 
+    /** Drops the open connection; the next job reopens it. */
     fun closeConnectionIfExists() {
-        if (mUsbDeviceConnection != null) {
-            mUsbDeviceConnection!!.releaseInterface(mUsbInterface)
-            mUsbDeviceConnection!!.close()
-            mUsbInterface = null
-            mEndPoint = null
-            mUsbDevice = null
-            mUsbDeviceConnection = null
-        }
+        mPrintExecutor.execute { closeConnection() }
     }
 
     val deviceList: List<UsbDevice>
@@ -176,202 +185,194 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
             return ArrayList(mUSBManager!!.deviceList.values)
         }
 
+    /**
+     * Makes (vendorId, productId) the target of the following [printBytes]
+     * calls. Returns false when no such device is attached. Nothing is opened
+     * here: the print thread opens the connection when a job needs it, and
+     * permission is requested then if missing.
+     */
     fun selectDevice(vendorId: Int, productId: Int): Boolean {
-//        Log.v(LOG_TAG, " status usb ______ $state")
         mSelectedVendorId = vendorId
         mSelectedProductId = productId
-        if ((mUsbDevice == null) || (mUsbDevice!!.vendorId != vendorId) || (mUsbDevice!!.productId != productId)) {
-            synchronized(printLock) {
-                closeConnectionIfExists()
-                val usbDevices: List<UsbDevice> = deviceList
-                for (usbDevice: UsbDevice in usbDevices) {
-                    if ((usbDevice.vendorId == vendorId) && (usbDevice.productId == productId)) {
-                        Log.v(LOG_TAG, "Request for device: vendor_id: " + usbDevice.vendorId + ", product_id: " + usbDevice.productId)
-                        closeConnectionIfExists()
-                        mUSBManager!!.requestPermission(usbDevice, mPermissionIndent)
-                        state = STATE_USB_CONNECTING
-                        mHandler?.obtainMessage(STATE_USB_CONNECTING)?.sendToTarget()
-                        return true
-                    }
-                }
-                return false
-            }
-        } else {
-            mHandler?.obtainMessage(state)?.sendToTarget()
-        }
-
-        return true
+        return findDevice(vendorId, productId) != null
     }
 
-    private fun openConnection(): Boolean {
-        if (mUsbDevice == null) {
-            Log.e(LOG_TAG, "USB Device is not initialized")
+    /**
+     * Sends [bytes] to the selected printer. [onDone] is called once, on the
+     * main thread, with whether every byte reached the printer.
+     */
+    fun printBytes(bytes: ByteArray, onDone: (Boolean) -> Unit) {
+        val vendorId = mSelectedVendorId
+        val productId = mSelectedProductId
+        if (vendorId == null || productId == null) {
+            Log.e(LOG_TAG, "printBytes called before connectPrinter selected a printer")
+            onDone(false)
+            return
+        }
+        Log.v(LOG_TAG, "Printing ${bytes.size} bytes to USB $vendorId:$productId")
+        enqueue(PrintJob(vendorId, productId, bytes, onDone))
+    }
+
+    private fun enqueue(job: PrintJob) {
+        val manager = mUSBManager
+        val device = findDevice(job.vendorId, job.productId)
+        if (manager == null || device == null) {
+            Log.e(LOG_TAG, "USB printer ${job.vendorId}:${job.productId} is not attached")
+            job.onDone(false)
+            return
+        }
+
+        // Jobs for a printer print in the order they were sent: if earlier ones
+        // are still waiting on its grant, this one waits behind them.
+        val waitingAhead = mPendingJobs.any { it.isFor(device) }
+        if (manager.hasPermission(device) && !waitingAhead) {
+            submit(job)
+            return
+        }
+
+        Log.i(LOG_TAG, "USB permission pending for ${device.deviceName}; holding print job until the grant lands")
+        mPendingJobs.addLast(job)
+        if (!waitingAhead) {
+            manager.requestPermission(device, mPermissionIndent)
+            updateState(STATE_USB_CONNECTING)
+        }
+        // Don't hold a job indefinitely (e.g. a permission dialog nobody
+        // answers): fail it so the caller can retry once the grant is in place.
+        mMainHandler.postDelayed({
+            if (mPendingJobs.remove(job)) {
+                Log.e(LOG_TAG, "USB permission for ${device.deviceName} not granted within ${JOB_START_DEADLINE_MS}ms; failing print job")
+                job.onDone(false)
+            }
+        }, JOB_START_DEADLINE_MS)
+    }
+
+    private fun isSelected(device: UsbDevice) =
+        device.vendorId == mSelectedVendorId && device.productId == mSelectedProductId
+
+    private fun takePendingJobsFor(device: UsbDevice): List<PrintJob> {
+        val jobs = mPendingJobs.filter { it.isFor(device) }
+        mPendingJobs.removeAll(jobs)
+        return jobs
+    }
+
+    private fun submit(job: PrintJob) {
+        mPrintExecutor.execute {
+            val ok = try {
+                runJob(job)
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "USB print job failed", e)
+                closeConnection()
+                false
+            }
+            mMainHandler.post { job.onDone(ok) }
+        }
+    }
+
+    // ── Print thread only ────────────────────────────────────────────────
+
+    private fun runJob(job: PrintJob): Boolean {
+        val waited = SystemClock.elapsedRealtime() - job.acceptedAt
+        if (waited > JOB_START_DEADLINE_MS) {
+            Log.e(LOG_TAG, "USB print job waited ${waited}ms to start; failing it unsent")
             return false
         }
-        if (mUSBManager == null) {
-            Log.e(LOG_TAG, "USB Manager is not initialized")
+        val device = findDevice(job.vendorId, job.productId)
+        if (device == null) {
+            Log.e(LOG_TAG, "USB printer ${job.vendorId}:${job.productId} detached before printing")
             return false
         }
-        if (mUsbDeviceConnection != null) {
-            Log.i(LOG_TAG, "USB Connection already connected")
-            return true
+        if (mUSBManager?.hasPermission(device) != true) {
+            Log.e(LOG_TAG, "No USB permission for ${device.deviceName}")
+            return false
         }
-        val usbInterface = mUsbDevice!!.getInterface(0)
-        for (i in 0 until usbInterface.endpointCount) {
-            val ep = usbInterface.getEndpoint(i)
-            if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                if (ep.direction == UsbConstants.USB_DIR_OUT) {
-                    val usbDeviceConnection = mUSBManager!!.openDevice(mUsbDevice)
-                    if (usbDeviceConnection == null) {
-                        Log.e(LOG_TAG, "Failed to open USB Connection")
-                        return false
-                    }
-                    Toast.makeText(mContext, mContext?.getString(R.string.connected_device), Toast.LENGTH_SHORT).show()
-                    return if (usbDeviceConnection.claimInterface(usbInterface, true)) {
-                        mEndPoint = ep
-                        mUsbInterface = usbInterface
-                        mUsbDeviceConnection = usbDeviceConnection
-                        true
-                    } else {
-                        usbDeviceConnection.close()
-                        Log.e(LOG_TAG, "Failed to retrieve usb connection")
-                        false
-                    }
-                }
-            }
-        }
-        return true
+        if (!ensureConnection(device)) return false
+        val ok = transfer(job.bytes)
+        // A failed transfer leaves the endpoint in an unknown state: reopen next time.
+        if (!ok) closeConnection()
+        return ok
     }
 
-    fun printText(text: String): Boolean {
-        Log.v(LOG_TAG, "Printing text")
-        val isConnected = openConnection()
-        return if (isConnected) {
-            Log.v(LOG_TAG, "Connected to device")
-            Thread {
-                synchronized(printLock) {
-                    val bytes: ByteArray = text.toByteArray(Charset.forName("UTF-8"))
-                    val b: Int = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, bytes, bytes.size, 100000)
-                    Log.i(LOG_TAG, "Return code: $b")
-                }
-            }.start()
-            true
-        } else {
-            Log.v(LOG_TAG, "Failed to connect to device")
-            false
-        }
-    }
+    private fun ensureConnection(device: UsbDevice): Boolean {
+        if (mUsbDeviceConnection != null && mUsbDevice?.deviceName == device.deviceName) return true
+        closeConnection()
 
-    fun printRawData(data: String): Boolean {
-        Log.v(LOG_TAG, "Printing raw data: $data")
-        val isConnected = openConnection()
-        return if (isConnected) {
-            Log.v(LOG_TAG, "Connected to device")
-            Thread {
-                synchronized(printLock) {
-                    val bytes: ByteArray = Base64.decode(data, Base64.DEFAULT)
-                    val b: Int = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, bytes, bytes.size, 100000)
-                    Log.i(LOG_TAG, "Return code: $b")
-                }
-            }.start()
-            true
-        } else {
-            Log.v(LOG_TAG, "Failed to connected to device")
-            false
-        }
-    }
+        val manager = mUSBManager ?: return false
+        for (i in 0 until device.interfaceCount) {
+            val usbInterface = device.getInterface(i)
+            for (e in 0 until usbInterface.endpointCount) {
+                val ep = usbInterface.getEndpoint(e)
+                if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK || ep.direction != UsbConstants.USB_DIR_OUT) continue
 
-    fun printBytes(bytes: ArrayList<Int>): Boolean {
-        Log.v(LOG_TAG, "Printing ${bytes.size} bytes to USB")
-
-        // Gate on permission. On a freshly booted device the runtime USB grant is
-        // gone, so selectDevice() has only *requested* it and mUsbDevice is still
-        // null / unpermitted. Opening + sending now would hit the async grant race
-        // and fail ("USB Device is not initialized"). Instead, stash the job and let
-        // the ACTION_USB_PERMISSION receiver run it once the grant lands.
-        //
-        // Require that mUsbDevice is the device selectDevice() just chose AND that we
-        // hold permission for it — so a stale device (e.g. after switching between two
-        // USB printers) is never printed to, and a missing grant always defers.
-        val device = mUsbDevice
-        val targetReady = device != null &&
-            device.vendorId == mSelectedVendorId &&
-            device.productId == mSelectedProductId &&
-            mUSBManager?.hasPermission(device) == true
-        if (!targetReady) {
-            Log.i(LOG_TAG, "USB target not ready (permission pending); deferring print job until grant lands")
-            mPendingPrintBytes = bytes
-            // Re-request only when the active device IS the selected one but its grant
-            // is missing (e.g. revoked). For a null/mismatched device, selectDevice()
-            // has already requested the correct device — don't poke a stale one.
-            if (device != null &&
-                device.vendorId == mSelectedVendorId &&
-                device.productId == mSelectedProductId) {
-                mUSBManager?.requestPermission(device, mPermissionIndent)
-            }
-            // selectDevice() (called by connectPrinter, before this) has already
-            // fired requestPermission for the selected device, so the grant is on its
-            // way regardless. Report accepted; the receiver runs the job on grant.
-            return true
-        }
-        return doPrintBytes(bytes)
-    }
-
-    private fun doPrintBytes(bytes: ArrayList<Int>): Boolean {
-        val isConnected = openConnection()
-        if (isConnected) {
-            val chunkSize = mEndPoint!!.maxPacketSize
-            Log.v(LOG_TAG, "USB endpoint max packet size: $chunkSize")
-
-            // FIXED: Run synchronously instead of in background thread
-            synchronized(printLock) {
-                val vectorData: Vector<Byte> = Vector()
-                for (i in bytes.indices) {
-                    val `val`: Int = bytes[i]
-                    vectorData.add(`val`.toByte())
-                }
-                val temp: Array<Any> = vectorData.toTypedArray()
-                val byteData = ByteArray(temp.size)
-                for (i in temp.indices) {
-                    byteData[i] = temp[i] as Byte
-                }
-
-                if (mUsbDeviceConnection != null) {
-                    var success = true
-                    if (byteData.size > chunkSize) {
-                        var chunks: Int = byteData.size / chunkSize
-                        if (byteData.size % chunkSize > 0) {
-                            ++chunks
-                        }
-                        Log.v(LOG_TAG, "Sending data in $chunks chunks")
-                        for (i in 0 until chunks) {
-                            val buffer: ByteArray = Arrays.copyOfRange(byteData, i * chunkSize, minOf(chunkSize + i * chunkSize, byteData.size))
-                            val b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, buffer, buffer.size, 100000)
-                            Log.i(LOG_TAG, "Chunk $i return code: $b")
-                            if (b < 0) {
-                                Log.e(LOG_TAG, "USB transfer failed for chunk $i with error code: $b")
-                                success = false
-                                break
-                            }
-                        }
-                    } else {
-                        val b = mUsbDeviceConnection!!.bulkTransfer(mEndPoint, byteData, byteData.size, 100000)
-                        Log.i(LOG_TAG, "USB bulkTransfer return code: $b (expected ${byteData.size})")
-                        if (b < 0) {
-                            Log.e(LOG_TAG, "USB transfer failed with error code: $b")
-                            success = false
-                        }
-                    }
-                    return success
-                } else {
-                    Log.e(LOG_TAG, "USB connection is null!")
+                val connection = manager.openDevice(device)
+                if (connection == null) {
+                    Log.e(LOG_TAG, "Failed to open USB connection to ${device.deviceName}")
                     return false
                 }
+                if (!connection.claimInterface(usbInterface, true)) {
+                    connection.close()
+                    Log.e(LOG_TAG, "Failed to claim USB interface $i on ${device.deviceName}")
+                    return false
+                }
+                mUsbDevice = device
+                mUsbDeviceConnection = connection
+                mUsbInterface = usbInterface
+                mEndPoint = ep
+                updateState(STATE_USB_CONNECTED)
+                mMainHandler.post {
+                    Toast.makeText(mContext, mContext?.getString(R.string.connected_device), Toast.LENGTH_SHORT).show()
+                }
+                return true
             }
-        } else {
-            Log.v(LOG_TAG, "Failed to connected to device")
-            return false
         }
+        Log.e(LOG_TAG, "No bulk OUT endpoint on ${device.deviceName}")
+        return false
+    }
+
+    private fun transfer(bytes: ByteArray): Boolean {
+        val connection = mUsbDeviceConnection ?: return false
+        val endpoint = mEndPoint ?: return false
+        val chunkSize = endpoint.maxPacketSize.coerceAtLeast(1)
+        var offset = 0
+        while (offset < bytes.size) {
+            val length = minOf(chunkSize, bytes.size - offset)
+            val chunk = Arrays.copyOfRange(bytes, offset, offset + length)
+            val sent = connection.bulkTransfer(endpoint, chunk, length, CHUNK_TIMEOUT_MS)
+            if (sent < 0) {
+                Log.e(LOG_TAG, "USB transfer failed at byte $offset of ${bytes.size}: bulkTransfer returned $sent")
+                return false
+            }
+            offset += length
+        }
+        Log.i(LOG_TAG, "USB transfer complete: ${bytes.size} bytes")
+        return true
+    }
+
+    private fun closeConnection() {
+        val connection = mUsbDeviceConnection
+        if (connection != null) {
+            try {
+                mUsbInterface?.let { connection.releaseInterface(it) }
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "releaseInterface failed: ${e.message}")
+            }
+            connection.close()
+        }
+        mUsbDeviceConnection = null
+        mUsbInterface = null
+        mEndPoint = null
+        mUsbDevice = null
+    }
+
+    // ── Either thread ────────────────────────────────────────────────────
+
+    private fun findDevice(vendorId: Int, productId: Int): UsbDevice? =
+        mUSBManager?.deviceList?.values?.firstOrNull {
+            it.vendorId == vendorId && it.productId == productId
+        }
+
+    private fun updateState(newState: Int) {
+        state = newState
+        mHandler?.obtainMessage(newState)?.sendToTarget()
     }
 
     companion object {
@@ -380,12 +381,18 @@ class USBPrinterService private constructor(private var mHandler: Handler?) {
         private const val LOG_TAG = "ESC POS Printer"
         private const val ACTION_USB_PERMISSION = "com.flutter_pos_printer.USB_PERMISSION"
 
+        // Per-chunk bulkTransfer timeout, unchanged from the synchronous version.
+        private const val CHUNK_TIMEOUT_MS = 100_000
+
+        // Shorter than the app's USB send timeout (10 s + size allowance), so the
+        // app hears "failed" rather than giving up while the job still waits
+        // here — a job the app has given up on must never print later.
+        private const val JOB_START_DEADLINE_MS = 8_000L
+
         // Constants that indicate the current connection state
         const val STATE_USB_NONE = 0 // we're doing nothing
         const val STATE_USB_CONNECTING = 2 // now initiating an outgoing connection
         const val STATE_USB_CONNECTED = 3 // now connected to a remote device
-
-        private val printLock = Any()
 
         fun getInstance(handler: Handler): USBPrinterService {
             if (mInstance == null) {

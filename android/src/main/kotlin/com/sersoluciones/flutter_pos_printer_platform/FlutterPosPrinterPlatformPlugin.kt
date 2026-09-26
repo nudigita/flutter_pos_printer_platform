@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.util.Base64
 import android.util.Log
 import android.widget.Toast
 import androidx.annotation.NonNull
@@ -289,17 +290,11 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                 printRawData(raw, result)
             }
             call.method.equals("printBytes") -> {
-                // FIXED: Handle both byte[] and ArrayList<Int> from Flutter
+                // Uint8List arrives as byte[]; a plain List<int> as a list of numbers.
                 val bytesArg: Any? = call.argument("bytes")
-                val bytes: ArrayList<Int>? = when (bytesArg) {
-                    is ByteArray -> {
-                        // Convert ByteArray to ArrayList<Int>
-                        ArrayList(bytesArg.map { it.toInt() and 0xFF })
-                    }
-                    is ArrayList<*> -> {
-                        @Suppress("UNCHECKED_CAST")
-                        bytesArg as? ArrayList<Int>
-                    }
+                val bytes: ByteArray? = when (bytesArg) {
+                    is ByteArray -> bytesArg
+                    is List<*> -> ByteArray(bytesArg.size) { i -> (bytesArg[i] as Number).toByte() }
                     else -> null
                 }
                 printBytes(bytes, result)
@@ -360,24 +355,20 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
     }
 
     private fun printText(text: String?, result: Result) {
-        if (text.isNullOrEmpty()) return
-        adapter.setHandler(usbHandler)
-        adapter.printText(text)
-        result.success(true)
+        if (text.isNullOrEmpty()) return result.success(false)
+        printBytes(text.toByteArray(Charsets.UTF_8), result)
     }
 
     private fun printRawData(base64Data: String?, result: Result) {
-        if (base64Data.isNullOrEmpty()) return
-        adapter.setHandler(usbHandler)
-        adapter.printRawData(base64Data)
-        result.success(true)
+        if (base64Data.isNullOrEmpty()) return result.success(false)
+        printBytes(Base64.decode(base64Data, Base64.DEFAULT), result)
     }
 
-    private fun printBytes(bytes: ArrayList<Int>?, result: Result) {
-        if (bytes == null) return
+    /** Replies once the bytes have reached the printer (true) or failed to (false). */
+    private fun printBytes(bytes: ByteArray?, result: Result) {
+        if (bytes == null) return result.success(false)
         adapter.setHandler(usbHandler)
-        adapter.printBytes(bytes)
-        result.success(true)
+        adapter.printBytes(bytes) { ok -> result.success(ok) }
     }
 
     private fun checkPermissions(): Boolean {
